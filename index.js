@@ -13,9 +13,9 @@ const express = require('express');
          '-f hls',
          '-hls_time 10',
          '-hls_list_size 6',
-         '-hls_segment_filename public/output%d.ts'
+         '-hls_segment_filename public/index%d.ts'
        ])
-       .output('public/output.m3u8')
+       .output('public/index.m3u8')
        .on('start', () => console.log('FFmpeg started'))
        .on('error', (err) => console.error('FFmpeg error:', err))
        .on('end', () => console.log('FFmpeg finished'))
