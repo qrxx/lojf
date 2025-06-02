@@ -1,100 +1,83 @@
 const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
 const path = require('path');
-const fs = require('fs');
-
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Map stream IDs to RTSP URLs (in production, use a config file or database)
-const streamMap = {
-  '314': 'rtsp://146.59.54.160/314'
-};
-
-// Store active FFmpeg processes and their last access time
-const activeStreams = new Map();
-const INACTIVITY_TIMEOUT = 60000; // 1 minute timeout for inactive streams
+// Store active FFmpeg processes to prevent duplicates
+const activeStreams = {};
 
 // Serve static files from the public directory
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Dynamic route for HLS stream
+// Handle dynamic RTSP stream requests
 app.get('/:streamId/output.m3u8', (req, res) => {
   const streamId = req.params.streamId;
-
-  // Validate streamId
-  if (!streamMap[streamId]) {
-    return res.status(404).send('Stream not found');
+  // Validate streamId (basic validation, can be extended)
+  if (!/^\d+$/.test(streamId)) {
+    return res.status(400).send('Invalid stream ID');
   }
 
-  const rtspUrl = streamMap[streamId];
-  const outputDir = path.join(__dirname, 'tmp', streamId);
-  const outputFile = path.join(outputDir, 'output.m3u8');
-
-  // Ensure output directory exists
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
-  }
+  // Construct RTSP URL internally
+  const rtspUrl = `rtsp://146.59.54.160/${streamId}`;
 
   // Check if stream is already running
-  if (!activeStreams.has(streamId)) {
-    const ffmpegProc = ffmpeg(rtspUrl)
-      .inputOptions('-rtsp_transport', 'tcp')
-      .outputOptions([
-        '-c:v copy', // Copy video to avoid re-encoding
-        '-c:a aac', // Transcode audio to AAC if needed
-        '-f hls',
-        '-hls_time 4', // Smaller segment duration for lower latency
-        '-hls_list_size 3', // Smaller playlist size for lower memory usage
-        '-hls_segment_filename', path.join(outputDir, 'segment%d.ts'),
-        '-hls_flags delete_segments' // Delete old segments to save disk space
-      ])
-      .output(outputFile)
-      .on('start', () => console.log(`FFmpeg started for stream ${streamId}`))
-      .on('error', (err) => {
-        console.error(`FFmpeg error for stream ${streamId}:`, err);
-        activeStreams.delete(streamId);
-        // Clean up output directory
-        fs.rmSync(outputDir, { recursive: true, force: true });
-      })
-      .on('end', () => {
-        console.log(`FFmpeg ended for stream ${streamId}`);
-        activeStreams.delete(streamId);
-        fs.rmSync(outputDir, { recursive: true, force: true });
-      });
-
-    // Start FFmpeg
-    ffmpegProc.run();
-    activeStreams.set(streamId, { proc: ffmpegProc, lastAccess: Date.now() });
-  } else {
-    // Update last access time
-    activeStreams.get(streamId).lastAccess = Date.now();
+  if (activeStreams[streamId]) {
+    console.log(`Serving existing stream for ID ${streamId}`);
+    return res.sendFile(path.join(__dirname, 'public', `output_${streamId}.m3u8`));
   }
 
-  // Serve the HLS playlist
-  res.sendFile(outputFile, (err) => {
-    if (err) {
-      console.error(`Error serving HLS playlist for stream ${streamId}:`, err);
-      res.status(500).send('Error serving stream');
-    }
-  });
+  // Set output file paths
+  const outputM3u8 = path.join(__dirname, 'public', `output_${streamId}.m3u8`);
+  const segmentFile = path.join(__dirname, 'public', `output_${streamId}%d.ts`);
+
+  // Configure FFmpeg with optimized settings
+  const ffmpegProcess = ffmpeg(rtspUrl)
+    .inputOptions('-rtsp_transport', 'tcp', '-buffer_size 102400') // Reduce buffer size
+    .outputOptions([
+      '-c:v libx264', // Use libx264 for better compression
+      '-preset ultrafast', // Fast encoding to reduce CPU/memory usage
+      '-tune zerolatency', // Optimize for low latency
+      '-vf scale=640:360', // Downscale to 360p to save memory
+      '-c:a aac',
+      '-b:a 96k', // Lower audio bitrate
+      '-f hls',
+      '-hls_time 4', // Shorter segments for faster processing
+      '-hls_list_size 4', // Smaller playlist to reduce memory
+      `-hls_segment_filename ${segmentFile}`
+    ])
+    .output(outputM3u8);
+
+  // Event handlers
+  ffmpegProcess
+    .on('start', () => {
+      console.log(`FFmpeg started for stream ID ${streamId}`);
+      activeStreams[streamId] = ffmpegProcess;
+    })
+    .on('error', (err) => {
+      console.error(`FFmpeg error for stream ID ${streamId}:`, err);
+      delete activeStreams[streamId];
+      res.status(500).send('Error processing stream');
+    })
+    .on('end', () => {
+      console.log(`FFmpeg finished for stream ID ${streamId}`);
+      delete activeStreams[streamId];
+    });
+
+  // Start FFmpeg process
+  ffmpegProcess.run();
+  res.sendFile(outputM3u8);
 });
 
-// Cleanup inactive streams
-setInterval(() => {
-  const now = Date.now();
-  for (const [streamId, stream] of activeStreams) {
-    if (now - stream.lastAccess > INACTIVITY_TIMEOUT) {
-      console.log(`Stopping inactive stream ${streamId}`);
-      stream.proc.kill();
-      activeStreams.delete(streamId);
-      const outputDir = path.join(__dirname, 'tmp', streamId);
-      fs.rmSync(outputDir, { recursive: true, force: true });
-    }
-  }
-}, 10000); // Check every 10 seconds
+// Cleanup on server shutdown
+process.on('SIGINT', () => {
+  Object.keys(activeStreams).forEach((streamId) => {
+    activeStreams[streamId].kill();
+    console.log(`Terminated FFmpeg process for stream ID ${streamId}`);
+  });
+  process.exit();
+});
 
-// Start the server
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
