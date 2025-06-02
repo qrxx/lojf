@@ -1,26 +1,34 @@
 const express = require('express');
 const ffmpeg = require('fluent-ffmpeg');
+const fs = require('fs');
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(express.static('public'));
 
+// Serve the HLS files for the selected channel
 app.get('/stream/:channel', (req, res) => {
   const channel = req.params.channel;
-
-  // Validate the channel input to avoid injection or errors
   if (!/^\d+$/.test(channel)) {
     return res.status(400).send('Invalid channel number');
   }
 
-  const rtspUrl = `rtsp://146.59.54.160/${channel}`;
+  // Folder to save HLS files for this channel
+  const outputFolder = `public/hls_${channel}`;
 
-  // Here is the key part — run ffmpeg on demand, but this is heavy!
-  // Instead of saving to disk, we can stream it directly (better for low RAM)
+  // Check if the playlist already exists, if so, serve it directly
+  const playlistPath = `${outputFolder}/output.m3u8`;
+  if (fs.existsSync(playlistPath)) {
+    return res.sendFile(playlistPath, { root: '.' });
+  }
 
-  res.contentType('application/vnd.apple.mpegurl'); // m3u8 mime type
+  // Make sure output folder exists
+  if (!fs.existsSync(outputFolder)) {
+    fs.mkdirSync(outputFolder);
+  }
 
-  ffmpeg(rtspUrl)
+  // Start ffmpeg to generate HLS for this channel
+  ffmpeg(`rtsp://146.59.54.160/${channel}`)
     .inputOptions('-rtsp_transport', 'tcp')
     .outputOptions([
       '-c:v copy',
@@ -28,15 +36,25 @@ app.get('/stream/:channel', (req, res) => {
       '-f hls',
       '-hls_time 10',
       '-hls_list_size 6',
-      '-hls_flags delete_segments', // auto delete old segments to save disk
+      `-hls_segment_filename ${outputFolder}/output%d.ts`
     ])
+    .output(`${outputFolder}/output.m3u8`)
     .on('start', () => console.log(`FFmpeg started for channel ${channel}`))
     .on('error', (err) => {
-      console.error('FFmpeg error:', err);
+      console.error(`FFmpeg error for channel ${channel}:`, err);
       res.status(500).send('Stream error');
     })
     .on('end', () => console.log(`FFmpeg finished for channel ${channel}`))
-    .pipe(res, { end: true });
+    .run();
+
+  // Give some time for playlist generation, then serve it (could be improved with better syncing)
+  setTimeout(() => {
+    if (fs.existsSync(playlistPath)) {
+      res.sendFile(playlistPath, { root: '.' });
+    } else {
+      res.status(503).send('Stream is starting, try again shortly');
+    }
+  }, 3000); // wait 3 seconds
 });
 
 app.listen(port, () => {
