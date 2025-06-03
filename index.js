@@ -5,7 +5,7 @@ const express = require('express');
 
      app.use(express.static('public'));
 
-     ffmpeg('rtsp://146.59.54.163/abc2')
+     ffmpeg('rtsp://146.59.54.163/history2')
        .inputOptions('-rtsp_transport', 'tcp')
        .outputOptions([
          '-c:v copy',
